@@ -1,24 +1,26 @@
-# PhyloVision — Interactive Phylogenetic Tree Builder
+# PhyloVision — Updated dashboard
+
+A student-friendly educational bioinformatics app with sequence input, alignment explorer, Neighbor-Joining tree view, tree interpretation, pairwise sequence-identity heatmap, CSV/Newick/FASTA exports, and a Creators & About tab.
+
+## Creator credits
+- Creator & project lead: Anureet Dutta
+- Co-creators: Sreejeeta Kundu, Aishwarya Banik, Arya Ghosh, Ram Argha Nayak
 
 ## Run locally
-1. Install Python 3.10 or newer.
-2. Open a terminal in this folder.
-3. Install dependencies:
-   `pip install -r requirements.txt`
-4. Start the app:
-   `streamlit run app.py`
+1. Install Python 3.10 or newer from https://www.python.org/downloads/ (on Windows, enable **Add Python to PATH**).
+2. Extract this folder.
+3. Open a terminal in the folder containing `app.py` and `requirements.txt`.
+4. Run:
+   ```bash
+   python -m pip install -r requirements.txt
+   python -m streamlit run app.py
+   ```
+5. Open the local URL printed in the terminal (usually http://localhost:8501).
 
-## What it does
-- Accepts FASTA sequences by upload or paste.
-- Validates sequence records.
-- Uses MAFFT or Clustal Omega if installed; otherwise equal-length sequences are treated as already aligned.
-- Builds a Neighbor Joining tree using Biopython.
-- Displays a circular interactive tree with zoom/pan controls.
-- Exports a Newick tree and aligned FASTA.
-
-## Scientific limitations
-- The included sample sequences are illustrative teaching data, not verified reference sequences.
-- Bootstrap support is not calculated in this prototype. Do not interpret branch labels as bootstrap values unless genuine support values are present.
-- The fallback for equal-length sequences does not perform alignment; it assumes the sequences are already aligned.
-- Use appropriate homologous sequences, document their sources, inspect alignments, and verify results before using the output in a report.
-- Protein input is supported at the interface level, but choose a distance model compatible with your data and validate the selected model for your analysis. For rigorous protein phylogeny, configure a suitable amino-acid distance model.
+## Important scientific notes
+- The built-in sequences are illustrative teaching data and are not verified biological references.
+- The current version expects equal-length, already-aligned sequences. It displays and exports that alignment; it does not run MAFFT or Clustal Omega internally.
+- The tree is constructed with Biopython Neighbor Joining using an uncorrected p-distance (identity) calculation.
+- Bootstrap support is not implemented. No bootstrap values are displayed or claimed.
+- Pairwise identity excludes gap and ambiguous positions from each pair's denominator. It is a descriptive similarity measure, not a confidence score.
+- For protein analyses, use a validated protein-specific model/tool for scientific conclusions. This app is an educational demonstrator.

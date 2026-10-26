@@ -1,314 +1,327 @@
-import io
-import math
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
-
+import io, re, math
 import streamlit as st
+import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
-from Bio import AlignIO, SeqIO, Phylo
-from Bio.Align import MultipleSeqAlignment
-from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
+from Bio import SeqIO, AlignIO, Phylo
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
 
-st.set_page_config(page_title="PhyloVision", page_icon="🧬", layout="wide")
+APP_DIR = Path(__file__).parent
+LOGO = APP_DIR / 'phyloVision_logo.png'
 
-st.markdown("""
+st.set_page_config(page_title='PhyloVision | From Sequences to Evolution', page_icon='🧬', layout='wide', initial_sidebar_state='expanded')
+
+st.markdown('''
 <style>
-:root { color-scheme: dark; }
-.stApp { background: radial-gradient(circle at 48% 20%, #0a1d39 0%, #061326 45%, #030b18 100%); color: #e6f1ff; }
-[data-testid="stSidebar"] {background: #071426; border-right: 1px solid #17345b;}
-.block-container {padding-top: 1.25rem; max-width: 1600px;}
-h1,h2,h3 {color:#eaf3ff;}
-.small-muted {color:#9db4d5;font-size:0.88rem;}
-.brand {font-size:2.0rem;font-weight:800;letter-spacing:-1px;}
-.brand span {color:#7c8cff;}
-.panel {background:rgba(8,24,47,.78); border:1px solid #193b65; border-radius:14px; padding:16px;}
-.metric {background:#0a1c34;border:1px solid #1b3c65;border-radius:12px;padding:13px;}
-div.stButton > button {background:linear-gradient(90deg,#3457ff,#6c48ff);color:white;border:0;border-radius:10px;font-weight:650;}
-div.stDownloadButton > button {border-radius:9px;border:1px solid #315582;}
-hr {border-color:#1b3658;}
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+:root { --pv-bg:#0c1022; --pv-panel:#151b35; --pv-panel2:#1b2342; --pv-border:#343e65; --pv-purple:#bb83ec; --pv-pink:#e58dbd; --pv-text:#f2f1ff; --pv-muted:#b9bfdc; }
+.stApp { background: radial-gradient(ellipse at 10% 0%, #27264e 0%, #11162c 36%, #0b1021 78%); color:var(--pv-text); font-family:'DM Sans',sans-serif; }
+[data-testid="stHeader"] { background:transparent; }
+[data-testid="stSidebar"] { background:linear-gradient(180deg,#171b37,#10152b); border-right:1px solid #30385c; }
+[data-testid="stSidebar"] * { color:#eeeaff; }
+.block-container { padding-top:1.1rem; padding-bottom:2rem; max-width:1600px; }
+.pv-card { background:linear-gradient(145deg,rgba(30,38,72,.92),rgba(19,25,49,.96)); border:1px solid var(--pv-border); border-radius:18px; padding:18px 20px; margin-bottom:14px; box-shadow:0 10px 28px rgba(0,0,0,.12); }
+.pv-muted { color:var(--pv-muted); font-size:.9rem; }
+.pv-kicker { color:#cba1f3; font-size:.75rem; text-transform:uppercase; letter-spacing:.13em; font-weight:700; }
+.pv-title { font-family:'Manrope',sans-serif; font-size:1.5rem; font-weight:800; color:#fbf9ff; margin:.1rem 0 .35rem 0; }
+.pv-section { font-family:'Manrope',sans-serif; font-size:1.08rem; font-weight:700; margin-bottom:10px; }
+.pv-pill { display:inline-block; background:#263e4c; color:#a7f3d0; border:1px solid #35665f; border-radius:99px; padding:5px 10px; font-size:.78rem; }
+div.stButton > button, div.stDownloadButton > button { border-radius:12px; border:1px solid #5a4d83; background:linear-gradient(110deg,#b66bd1,#7664d9); color:white; font-weight:700; min-height:2.6rem; }
+div.stButton > button:hover, div.stDownloadButton > button:hover { border-color:#e2c2ff; color:white; filter:brightness(1.08); }
+.stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] { background:#121a35!important; color:#f5f3ff!important; border-color:#414b75!important; border-radius:10px!important; }
+[data-testid="stMetric"] { background:#171f3d; padding:13px 16px; border:1px solid #354064; border-radius:14px; }
+[data-testid="stMetricLabel"] { color:#c5c9e5!important; }
+[data-testid="stMetricValue"] { color:#fff!important; }
+hr { border-color:#30395d; }
+footer {visibility:hidden;}
 </style>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
-def parse_fasta(text):
-    records = list(SeqIO.parse(io.StringIO(text), "fasta"))
-    if len(records) < 3:
-        raise ValueError("Please provide at least 3 sequences in FASTA format.")
-    names = [r.id for r in records]
-    if len(set(names)) != len(names):
-        raise ValueError("Each FASTA record must have a unique identifier.")
-    for r in records:
-        if not str(r.seq).strip():
-            raise ValueError(f"Sequence '{r.id}' is empty.")
-    return records
+# Demo sequences are clearly labelled teaching examples; users can replace them.
+DEMO_FASTA = '''>Human_demo\nATGCTAGCTAGCTACGATCGATCGATGCTAGCTAGCTAACGTTAGCTAGCTAGGCTAACGATCGATCGATGCTAGC\n>Chimp_demo\nATGCTAGCTAGCTACGATCGATCGATGCTAGCTAGCTAACGTTAGCTAGCTAGGCTAACGATCGATCGATGCTAGT\n>Gorilla_demo\nATGCTAGCTAGCTACGATCGATCGATGCTAGCTAGCTAACGTTAGCTAGCTAGGCTAACGATCGATCAATGCTAGT\n>Mouse_demo\nATGATAGCTTGCTACGATCAATCGATGCTAGATAGCTAACGTTAGCTAGTTAGGCTAACGATCAATCGATGCTAGT\n>Rat_demo\nATGATAGCTTGCTACGATCAATCGATGCTAGATAGCTAACGTTAGCTAGTTAGGCTAACGATCAATCGATGCTAGC'''
+BASE_COLORS = {'A':'#65bd8b','T':'#ed7e88','G':'#f1bd65','C':'#67b8ee','U':'#b89ce9','-':'#59627f','N':'#8b8fa7'}
+CREATOR = 'Anureet Dutta'
+CO_CREATORS = ['Sreejeeta Kundu','Aishwarya Banik','Arya Ghosh','Ram Argha Nayak']
 
-def run_alignment(records):
-    """Use MAFFT/Clustal Omega if installed; otherwise accept equal-length sequences as pre-aligned."""
-    for executable, args in [
-        ("mafft", ["--auto", "--quiet"]),
-        ("clustalo", ["-i", "-", "-o", "-", "--outfmt=fasta", "--force"])
-    ]:
-        exe = shutil.which(executable)
-        if not exe:
-            continue
-        with tempfile.TemporaryDirectory() as td:
-            inp = Path(td) / "input.fasta"
-            inp.write_text("".join(f">{r.id}\n{str(r.seq)}\n" for r in records))
-            try:
-                if executable == "mafft":
-                    proc = subprocess.run([exe, *args, str(inp)], capture_output=True, text=True, timeout=90)
-                else:
-                    fasta = inp.read_text()
-                    proc = subprocess.run([exe, *args], input=fasta, capture_output=True, text=True, timeout=90)
-                if proc.returncode == 0 and proc.stdout.strip():
-                    aligned = list(SeqIO.parse(io.StringIO(proc.stdout), "fasta"))
-                    if len(aligned) == len(records) and len({len(r.seq) for r in aligned}) == 1:
-                        return aligned, executable.upper()
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-    lengths = {len(r.seq) for r in records}
-    if len(lengths) == 1:
-        return records, "Input sequences (equal length; assumed pre-aligned)"
-    raise RuntimeError(
-        "These sequences have different lengths, but MAFFT/Clustal Omega was not found. "
-        "Install MAFFT or Clustal Omega, or upload an already aligned FASTA file where all sequences have equal length."
-    )
-
-def make_tree(aligned, model):
-    alignment = MultipleSeqAlignment([
-        SeqRecord(Seq(str(r.seq).upper()), id=r.id, description="") for r in aligned
-    ])
-    calculator = DistanceCalculator(model)
-    matrix = calculator.get_distance(alignment)
-    constructor = DistanceTreeConstructor()
-    tree = constructor.nj(matrix)
-    tree.rooted = False
-    return tree, matrix, alignment
-
-def circular_tree_figure(tree, show_support=True):
-    terminals = tree.get_terminals()
-    n = len(terminals)
-    if n < 2:
-        return go.Figure()
-    # assign terminal angles; internal angles are circular means of descendants
-    angles = {}
-    for i, tip in enumerate(terminals):
-        angles[tip] = 2 * math.pi * i / n
-    def set_angles(clade):
-        if clade in angles:
-            return angles[clade]
-        child_angles = [set_angles(c) for c in clade.clades]
-        x = sum(math.cos(a) for a in child_angles)
-        y = sum(math.sin(a) for a in child_angles)
-        angles[clade] = math.atan2(y, x) % (2 * math.pi)
-        return angles[clade]
-    set_angles(tree.root)
-    depths = tree.depths()
-    max_depth = max(depths.values()) or 1.0
-    radii = {clade: 0.12 + 0.82 * depths[clade] / max_depth for clade in depths}
-    xs, ys = [], []
-    colors = ["#55c8ff", "#8b7bff", "#ff668f", "#ffb454", "#53d6b2", "#70e08a", "#d58bff"]
-    color_for = {}
-    for i, tip in enumerate(terminals):
-        color_for[tip] = colors[i % len(colors)]
-    # give descendants a shared clade color based on the first descendant tip
-    def tip_color(clade):
-        if clade in color_for:
-            return color_for[clade]
-        c = tip_color(clade.clades[0])
-        color_for[clade] = c
-        return c
-    edge_traces = []
-    for clade in tree.find_clades(order="preorder"):
-        if clade.is_terminal():
-            continue
-        child_angles = [angles[c] for c in clade.clades]
-        # radial spokes
-        for child in clade.clades:
-            a = angles[child]
-            r0, r1 = radii[clade], radii[child]
-            edge_traces.append(go.Scatter(
-                x=[r0*math.cos(a), r1*math.cos(a)],
-                y=[r0*math.sin(a), r1*math.sin(a)],
-                mode="lines", line=dict(color=tip_color(child), width=2.2),
-                hoverinfo="skip", showlegend=False
-            ))
-        # arc connecting child branches at parent radius
-        if len(child_angles) >= 2:
-            ordered = sorted(child_angles)
-            # shortest arc through sorted angles; use unwrapped range
-            a0, a1 = min(child_angles), max(child_angles)
-            if a1 - a0 > math.pi:
-                a0, a1 = a1, a0 + 2*math.pi
-            arc = [a0 + (a1-a0)*j/35 for j in range(36)]
-            edge_traces.append(go.Scatter(
-                x=[radii[clade]*math.cos(a) for a in arc],
-                y=[radii[clade]*math.sin(a) for a in arc],
-                mode="lines", line=dict(color="#355579", width=1.4),
-                hoverinfo="skip", showlegend=False
-            ))
-    fig = go.Figure()
-    for trace in edge_traces:
-        fig.add_trace(trace)
-    for tip in terminals:
-        a, r = angles[tip], radii[tip]
-        x, y = r*math.cos(a), r*math.sin(a)
-        fig.add_trace(go.Scatter(
-            x=[x], y=[y], mode="markers+text",
-            text=[tip.name], textposition="middle right",
-            textfont=dict(size=11, color="#dceaff"),
-            marker=dict(size=8, color=tip_color(tip), line=dict(width=1, color="#e7f3ff")),
-            hovertemplate=f"<b>{tip.name}</b><br>Distance from root: {depths[tip]:.4f}<extra></extra>",
-            showlegend=False
-        ))
-    # branch labels only if present in tree; NJ tree usually has no bootstrap support
-    if show_support:
-        for clade in tree.find_clades(order="preorder"):
-            if clade.is_terminal() or clade.confidence is None:
-                continue
-            a, r = angles[clade], radii[clade]
-            fig.add_annotation(x=(r+0.035)*math.cos(a), y=(r+0.035)*math.sin(a),
-                               text=str(round(clade.confidence)), showarrow=False,
-                               font=dict(size=10, color="#ffcf78"))
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=10,r=10,t=10,b=10), height=540,
-        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1, range=[-1.25,1.4]),
-        yaxis=dict(visible=False, range=[-1.15,1.15]),
-        dragmode="pan", showlegend=False,
-        font=dict(family="Inter, Arial", color="#dceaff")
-    )
-    return fig
-
-def newick_text(tree):
-    out = io.StringIO()
-    Phylo.write(tree, out, "newick")
-    return out.getvalue()
-
-SAMPLE = """>Homo_sapiens
-ATGCTAGCTAGCTACGATCGATCGTACGATCGATCG
->Pan_troglodytes
-ATGCTAGCTAGCTACGATCGATCGTACGATCGATCA
->Gorilla_gorilla
-ATGCTAGCTAGCTACGATCGATCGTATGATCGATCA
->Pongo_abelii
-ATGCTAGCTAGTTACGATCGATCGTATGATCGATCA
->Mus_musculus
-TTGCCAGCTTGCTACGATAGATCGTATGATCAATCA
->Rattus_norvegicus
-TTGCCAGCTTGCTACGATAGATCGTATGATCAATCT
-"""
-
-if "fasta_text" not in st.session_state:
-    st.session_state.fasta_text = SAMPLE
-if "analysis" not in st.session_state:
-    st.session_state.analysis = None
+# Header with the supplied project logo.
+h1, h2 = st.columns([1.5, 3.6], vertical_alignment='center')
+with h1:
+    if LOGO.exists(): st.image(str(LOGO), width=280)
+    else: st.markdown('<div class="pv-title">🧬 PhyloVision</div>', unsafe_allow_html=True)
+with h2:
+    st.markdown('<div class="pv-kicker">From Sequences to Evolution</div><div style="font-size:1.55rem;font-weight:700;color:#f7f4ff;font-family:Manrope">Explore biological relationships, clearly.</div><div class="pv-muted">A student-friendly workspace for sequence alignment, tree building and interpretation.</div>', unsafe_allow_html=True)
+st.markdown('')
 
 with st.sidebar:
-    st.markdown('<div class="brand">🧬 Phylo<span>Vision</span></div>', unsafe_allow_html=True)
-    st.caption("FROM SEQUENCES TO EVOLUTION")
-    st.markdown("---")
-    page = st.radio("NAVIGATION", ["Tree Builder", "Alignment", "Analysis Results", "About"], label_visibility="visible")
-    st.markdown("---")
-    st.markdown("### Input sequences")
-    upload = st.file_uploader("Upload FASTA", type=["fasta", "fa", "fas", "txt"])
-    if upload is not None:
-        st.session_state.fasta_text = upload.getvalue().decode("utf-8", errors="replace")
-    st.session_state.fasta_text = st.text_area(
-        "Or paste FASTA sequences", value=st.session_state.fasta_text, height=210,
-        help="Each sequence must start with a header such as >sequence_name."
-    )
-    seq_type = st.selectbox("Sequence type", ["DNA", "Protein"])
-    method = st.selectbox("Tree method", ["Neighbor Joining (NJ)"])
-    model = st.selectbox("Distance model", ["identity", "blastn", "trans"])
-    show_support = st.checkbox("Show branch support if available", value=True)
-    st.caption("Bootstrap support is not automatically calculated by this basic version.")
-    run = st.button("✦  Build Phylogenetic Tree", use_container_width=True)
+    st.markdown('### 🧬 PhyloVision')
+    st.caption('BIOINFORMATICS WORKSPACE')
+    page = st.radio('Navigate', ['Home','Sequence Input','Alignment Explorer','Phylogenetic Tree','Understand My Tree','Sequence Similarity','Creators & About'], label_visibility='collapsed')
+    st.markdown('---')
+    st.markdown('**Workflow**')
+    st.markdown('1. Add sequences\n2. Review alignment\n3. Build a tree\n4. Interpret similarities')
+    st.markdown('---')
+    st.caption('Educational project • Results depend on input quality and method.')
 
-st.markdown('<div class="brand">Phylo<span>Vision</span> <span style="font-size:1rem;color:#91a9cc;font-weight:400;">/ Interactive Tree Lab</span></div>', unsafe_allow_html=True)
-st.markdown('<div class="small-muted">Explore evolutionary patterns. Inspect branches. Keep the evidence reproducible.</div>', unsafe_allow_html=True)
-st.markdown("")
+if 'fasta_text' not in st.session_state: st.session_state.fasta_text = DEMO_FASTA
+if 'tree' not in st.session_state: st.session_state.tree = None
+if 'aligned_records' not in st.session_state: st.session_state.aligned_records = None
+if 'dist_df' not in st.session_state: st.session_state.dist_df = None
+if 'tree_method' not in st.session_state: st.session_state.tree_method = 'Neighbor Joining'
+if 'sequence_type' not in st.session_state: st.session_state.sequence_type = 'DNA'
 
-if run:
+
+def parse_fasta(text):
+    if not text.strip(): raise ValueError('Please paste or upload FASTA sequences first.')
+    try: records = list(SeqIO.parse(io.StringIO(text), 'fasta'))
+    except Exception as e: raise ValueError(f'Could not read FASTA: {e}')
+    if len(records) < 3: raise ValueError('Please provide at least 3 sequences to build a useful example tree.')
+    seen=set()
+    for i,r in enumerate(records):
+        r.id = re.sub(r'\s+','_',r.id.strip()) or f'Sequence_{i+1}'
+        r.name=r.id; r.description=''
+        if r.id in seen: raise ValueError(f'Duplicate sequence name: {r.id}. Please use unique FASTA headers.')
+        seen.add(r.id)
+        r.seq = Seq(str(r.seq).upper().replace(' ','').replace('.', '-'))
+        if not str(r.seq): raise ValueError(f'{r.id} has an empty sequence.')
+    return records
+
+
+def validate_records(records, seq_type):
+    allowed = set('ACGTUNRYKMSWBDHV-') if seq_type == 'DNA' else set('ABCDEFGHIKLMNPQRSTVWXYZJUO*-')
+    issues=[]
+    for r in records:
+        invalid=sorted(set(str(r.seq).upper())-allowed)
+        if invalid: issues.append(f'{r.id}: unsupported character(s) {", ".join(invalid)}')
+    lengths={len(r.seq) for r in records}
+    if len(lengths)>1: issues.append('Sequences have different lengths. They may not be aligned yet; this version can compare them only after equal-length alignment.')
+    if issues: raise ValueError('\n'.join(issues))
+    return records
+
+
+def pairwise_p_distance(a,b):
+    pairs=[(x,y) for x,y in zip(str(a).upper(),str(b).upper()) if x not in '-N?' and y not in '-N?']
+    if not pairs: return np.nan
+    return sum(x!=y for x,y in pairs)/len(pairs)
+
+
+def make_distance_matrix(records):
+    names=[r.id for r in records]
+    mat=np.zeros((len(records),len(records)))
+    for i in range(len(records)):
+        for j in range(i+1,len(records)):
+            d=pairwise_p_distance(records[i].seq,records[j].seq)
+            mat[i,j]=mat[j,i]=d
+    return pd.DataFrame(mat,index=names,columns=names)
+
+
+def build_tree(records, model):
+    # DistanceCalculator's identity model is a transparent p-distance estimate (1 - identity).
+    calc_model = 'identity'
+    calculator=DistanceCalculator(calc_model, skip_letters='N?-')
+    dm=calculator.get_distance(records)
+    constructor=DistanceTreeConstructor()
+    tree=constructor.nj(dm)
+    tree.rooted=False
+    return tree
+
+
+def rectangular_tree_figure(tree):
+    # Render branch lengths with an elegant rectangular phylogram.
+    terminals=tree.get_terminals(); n=len(terminals)
+    ymap={term: i for i,term in enumerate(terminals)}
+    def assign_y(clade):
+        if clade.is_terminal(): return ymap[clade]
+        vals=[assign_y(c) for c in clade.clades]
+        ymap[clade]=sum(vals)/len(vals)
+        return ymap[clade]
+    assign_y(tree.root)
+    xmap={tree.root:0.0}
+    def assign_x(clade, parent_x):
+        for c in clade.clades:
+            length=float(c.branch_length or 0.01)
+            xmap[c]=parent_x+max(length,0.002)
+            assign_x(c,xmap[c])
+    assign_x(tree.root,0.0)
+    fig=go.Figure()
+    palette=['#d58be8','#68c9c3','#f1bd65','#77a7f8','#e78a9e','#93d59a']
+    for idx,clade in enumerate(tree.get_nonterminals(order='preorder')):
+        if clade is tree.root: continue
+    for parent in tree.find_clades(order='preorder'):
+        if parent.is_terminal(): continue
+        children=parent.clades
+        if not children: continue
+        ys=[ymap[c] for c in children]
+        fig.add_trace(go.Scatter(x=[xmap[parent],xmap[parent]],y=[min(ys),max(ys)],mode='lines',line=dict(color='#7e8ab9',width=2),hoverinfo='skip',showlegend=False))
+        for c in children:
+            color=palette[terminals.index(c)%len(palette)] if c.is_terminal() else '#8b83c8'
+            fig.add_trace(go.Scatter(x=[xmap[parent],xmap[c]],y=[ymap[c],ymap[c]],mode='lines',line=dict(color=color,width=2.4),hoverinfo='skip',showlegend=False))
+    maxx=max(xmap.values()) if xmap else 1
+    for t in terminals:
+        fig.add_trace(go.Scatter(x=[xmap[t]],y=[ymap[t]],mode='markers+text',text=[t.name],textposition='middle right',textfont=dict(color='#eeeaff',size=11),marker=dict(size=7,color=palette[terminals.index(t)%len(palette)]),hovertemplate=f'<b>{t.name}</b><br>Root distance: {xmap[t]:.4f}<extra></extra>',showlegend=False))
+    fig.update_layout(height=max(430,n*42),margin=dict(l=10,r=130,t=10,b=10),paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',xaxis=dict(title='Accumulated branch length (relative evolutionary change)',showgrid=True,gridcolor='rgba(130,145,190,.15)',zeroline=False,color='#c4cbe8',rangemode='tozero'),yaxis=dict(visible=False,autorange='reversed'),font=dict(family='DM Sans',color='#f4f1ff'),showlegend=False)
+    return fig
+
+
+def alignment_html(records, max_cols=90):
+    max_len=min(max(len(r.seq) for r in records),max_cols)
+    html='<div style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:2px;font:12px monospace;color:#f4f1ff;width:max-content"><thead><tr><th style="text-align:left;position:sticky;left:0;background:#171e3a;padding:6px">Sequence</th>'
+    for i in range(max_len):
+        if i % 10 == 0: html+=f'<th colspan="1" style="color:#b9bfdc;padding:2px">{i+1}</th>'
+        else: html+='<th style="padding:2px"></th>'
+    html+='</tr></thead><tbody>'
+    for r in records:
+        html+=f'<tr><td style="padding:4px 8px;position:sticky;left:0;background:#171e3a;white-space:nowrap">{r.id}</td>'
+        for ch in str(r.seq)[:max_len]:
+            c=BASE_COLORS.get(ch,'#8b8fa7')
+            html+=f'<td style="background:{c};color:#10162b;border-radius:3px;text-align:center;min-width:17px;padding:3px">{ch}</td>'
+        html+='</tr>'
+    html+='</tbody></table></div>'
+    return html, max_len
+
+
+def explain_tree(tree, names):
+    terms=tree.get_terminals()
+    if len(terms)<2: return ['Not enough sequences to explain the tree.']
+    pairs=[]
+    for i,a in enumerate(terms):
+        for b in terms[i+1:]:
+            try: d=tree.distance(a,b)
+            except Exception: continue
+            pairs.append((d,a.name,b.name))
+    pairs.sort()
+    findings=[]
+    if pairs:
+        d,a,b=pairs[0]
+        findings.append(f'**Closest pair in this tree:** {a} and {b} have the smallest patristic distance in this inferred tree ({d:.4f}). This is a result of the supplied sequences and method, not proof that one modern organism descended from the other.')
+    root=tree.root
+    if root.clades:
+        largest=max(root.clades,key=lambda c:len(c.get_terminals()))
+        if len(largest.get_terminals())>=2:
+            members=', '.join(t.name for t in largest.get_terminals())
+            findings.append(f'**One large grouping:** {members} appear together on one side of the current unrooted tree. Tree orientation/rooting affects how the grouping is displayed.')
+    findings.append('**Branch lengths:** longer paths represent greater estimated sequence change under the distance calculation. They do not automatically represent elapsed time.')
+    findings.append('**Confidence:** this version does not calculate bootstrap support. Do not interpret branch lengths or visual spacing as confidence values.')
+    return findings
+
+
+def current_records():
+    records=parse_fasta(st.session_state.fasta_text)
+    validate_records(records, st.session_state.sequence_type)
+    return records
+
+# Home
+if page == 'Home':
+    st.markdown('<div class="pv-card"><div class="pv-kicker">Welcome to your sequence workspace</div><div class="pv-title">From raw sequences to clearer relationships.</div><div class="pv-muted">PhyloVision brings sequence input, alignment inspection, similarity comparison and phylogenetic tree interpretation into one calm, student-friendly workflow.</div></div>',unsafe_allow_html=True)
+    a,b,c=st.columns(3)
+    for col,icon,title,desc in [(a,'🧬','Alignment Explorer','Inspect matching positions, differences and gaps.'),(b,'🌿','Understand My Tree','Get a plain-language explanation of the inferred tree.'),(c,'▦','Sequence Similarity','Compare pairwise sequence identity in a heatmap and table.')]:
+        with col: st.markdown(f'<div class="pv-card" style="min-height:155px"><div style="font-size:1.5rem">{icon}</div><div class="pv-section">{title}</div><div class="pv-muted">{desc}</div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="pv-card"><div class="pv-section">Quick start</div><ol><li>Open <b>Sequence Input</b> and upload or paste FASTA records.</li><li>Choose DNA or protein and review any validation messages.</li><li>Open <b>Alignment Explorer</b> to inspect sequence positions.</li><li>Choose <b>Phylogenetic Tree</b> and build the tree.</li><li>Use <b>Understand My Tree</b> and <b>Sequence Similarity</b> to interpret the output.</li></ol><div class="pv-muted">The included sample sequences are illustrative teaching data, not verified reference sequences.</div></div>',unsafe_allow_html=True)
+
+elif page == 'Sequence Input':
+    st.markdown('<div class="pv-title">Sequence Input</div><div class="pv-muted">Upload a FASTA file or paste sequences. Give each sequence a unique header.</div>',unsafe_allow_html=True)
+    left,right=st.columns([1.15,1])
+    with left:
+        typ=st.selectbox('Sequence type',['DNA','Protein'],index=0 if st.session_state.sequence_type=='DNA' else 1)
+        st.session_state.sequence_type=typ
+        uploaded=st.file_uploader('Upload FASTA',type=['fasta','fa','fna','faa','txt'])
+        if uploaded is not None:
+            st.session_state.fasta_text=uploaded.getvalue().decode('utf-8',errors='replace')
+        st.session_state.fasta_text=st.text_area('Or paste FASTA text',value=st.session_state.fasta_text,height=260,help='FASTA format: each record begins with > followed by a unique sequence name.')
+        if st.button('Validate sequences',use_container_width=True):
+            try:
+                recs=current_records(); st.success(f'Validated {len(recs)} sequences. All have equal length ({len(recs[0].seq)} positions), suitable for the current analysis.')
+            except Exception as e: st.error(str(e))
+        if st.button('Load teaching example',use_container_width=True):
+            st.session_state.fasta_text=DEMO_FASTA; st.session_state.sequence_type='DNA'; st.session_state.tree=None; st.rerun()
+    with right:
+        st.markdown('<div class="pv-card"><div class="pv-section">FASTA checklist</div><ul><li>Use a header starting with <code>&gt;</code>.</li><li>Use unique, readable sequence names.</li><li>Use homologous sequences from a documented source for real analysis.</li><li>Sequences must be aligned and equal in length for this version.</li></ul></div>',unsafe_allow_html=True)
+        try:
+            recs=current_records(); st.metric('Sequences detected',len(recs)); st.metric('Sequence length',f'{len(recs[0].seq)} positions'); st.caption('Validation preview only; the full alignment should be biologically meaningful.')
+        except Exception as e: st.warning(str(e))
+
+elif page == 'Alignment Explorer':
+    st.markdown('<div class="pv-title">Alignment Explorer</div><div class="pv-muted">Compare the sequences column by column. Colored letters make conserved and variable positions easier to spot.</div>',unsafe_allow_html=True)
     try:
-        records = parse_fasta(st.session_state.fasta_text)
-        aligned, alignment_method = run_alignment(records)
-        tree, matrix, alignment = make_tree(aligned, model)
-        st.session_state.analysis = {
-            "records": records, "aligned": aligned, "alignment": alignment,
-            "tree": tree, "matrix": matrix, "alignment_method": alignment_method,
-            "model": model, "seq_type": seq_type, "method": method
-        }
-        st.success(f"Analysis completed for {len(records)} sequences.")
-    except Exception as e:
-        st.error(str(e))
+        records=current_records(); lengths={len(r.seq) for r in records}
+        if len(lengths)!=1: st.error('Sequences are different lengths. Please provide an alignment before using this view.')
+        else:
+            html,shown=alignment_html(records)
+            st.markdown('<div class="pv-card"><div class="pv-section">Multiple sequence alignment</div><div class="pv-muted">Showing the first '+str(shown)+' positions. A = adenine, T = thymine, G = guanine, C = cytosine; gaps are shown as dashes.</div><br>'+html+'</div>',unsafe_allow_html=True)
+            seqs=np.array([list(str(r.seq)) for r in records]); ncols=seqs.shape[1]
+            conserved=[]; variable=[]
+            for j in range(ncols):
+                chars=[x for x in seqs[:,j] if x not in '-N?']; unique=set(chars)
+                if len(unique)<=1: conserved.append(j+1)
+                else: variable.append(j+1)
+            a,b,c=st.columns(3); a.metric('Sequences',len(records)); b.metric('Alignment length',f'{ncols} bp' if st.session_state.sequence_type=='DNA' else f'{ncols} aa'); c.metric('Variable positions',len(variable))
+            st.markdown('<div class="pv-card"><div class="pv-section">How to read this alignment</div><p>Each vertical column represents a position being compared across sequences. A column with the same character in most sequences is relatively conserved; a column with multiple characters is variable. Gaps can represent insertions or deletions introduced during alignment.</p><p class="pv-muted">Important: equal sequence lengths do not prove that the sequences are correctly aligned. Use a trusted alignment tool and check the biological context for research-quality work.</p></div>',unsafe_allow_html=True)
+            st.download_button('Download aligned FASTA',data=''.join(f'>{r.id}\n{str(r.seq)}\n' for r in records),file_name='phylovision_alignment.fasta',mime='text/plain')
+    except Exception as e: st.warning(str(e))
 
-data = st.session_state.analysis
-if data is None:
-    st.info("Load the sample sequences or upload your own FASTA file, then select **Build Phylogenetic Tree**. The sample data are illustrative teaching sequences.")
-    st.markdown("### Your workspace")
-    a,b,c = st.columns(3)
-    a.metric("Sequence input", "FASTA")
-    b.metric("Tree style", "Circular / radial")
-    c.metric("Export", "Newick")
-    st.markdown("#### What this prototype can do")
-    st.write("Validate FASTA input, align equal-length sequences or use MAFFT/Clustal Omega if installed, infer a Neighbor Joining tree, inspect a circular tree, review alignment, and export Newick.")
-else:
-    records = data["records"]
-    aligned = data["aligned"]
-    tree = data["tree"]
-    alignment = data["alignment"]
-    if page == "Tree Builder":
-        left, center, right = st.columns([1.15, 2.4, 1.2], gap="medium")
-        with left:
-            st.markdown("### Dataset")
-            st.metric("Sequences", len(records))
-            st.metric("Alignment length", f"{alignment.get_alignment_length()} bp/aa")
-            st.caption(f"Alignment: {data['alignment_method']}")
-            st.markdown("### Sequences")
-            for rec in records:
-                st.markdown(f"🟢 `{rec.id}`")
-            st.markdown("### View controls")
-            st.caption("Use the chart toolbar to zoom, pan, reset and save an image.")
-        with center:
-            st.markdown("### ✧ Circular phylogenetic tree")
-            st.caption("Tip labels identify sequences. Branch lengths reflect the selected distance calculation.")
-            fig = circular_tree_figure(tree, show_support)
-            st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawopenpath"]})
-            st.caption("Important: this basic Neighbor Joining run does not calculate bootstrap support. Support labels appear only if the tree includes confidence values.")
-        with right:
-            st.markdown("### Analysis summary")
-            st.success("Tree generated")
-            st.markdown(f"**Method**  \n{data['method']}")
-            st.markdown(f"**Distance model**  \n{data['model']}")
-            st.markdown(f"**Input / alignment**  \n{data['alignment_method']}")
-            st.markdown("### Key notes")
-            st.write("• Clusters depend on sequence selection and alignment.")
-            st.write("• A tree shows inferred relationships, not direct proof of ancestry.")
-            st.write("• Use bootstrap or another support analysis before making strong claims.")
-            st.download_button("↓ Download Tree (Newick)", newick_text(tree), file_name="phylovision_tree.nwk", mime="text/plain", use_container_width=True)
-            st.download_button("↓ Download Alignment (FASTA)", "".join(f">{r.id}\n{r.seq}\n" for r in aligned), file_name="phylovision_alignment.fasta", mime="text/plain", use_container_width=True)
-    elif page == "Alignment":
-        st.markdown("### Multiple sequence alignment")
-        st.caption(f"Alignment method: {data['alignment_method']}")
-        st.code("".join(f">{r.id}\n{r.seq}\n" for r in aligned), language="text")
-        st.write("Conserved columns can indicate shared sequence features. Gaps may represent inferred insertions or deletions, but alignment quality should be checked.")
-    elif page == "Analysis Results":
-        st.markdown("### Analysis results")
-        st.write(f"**Sequences:** {len(records)}")
-        st.write(f"**Alignment length:** {alignment.get_alignment_length()}")
-        st.write(f"**Tree method:** {data['method']}")
-        st.write(f"**Distance model:** {data['model']}")
-        st.markdown("#### Pairwise distances")
-        st.dataframe(data["matrix"].format_phylip().splitlines(), use_container_width=True)
-        st.download_button("Download Newick tree", newick_text(tree), file_name="phylovision_tree.nwk")
+elif page == 'Phylogenetic Tree':
+    st.markdown('<div class="pv-title">Phylogenetic Tree</div><div class="pv-muted">Build a distance-based tree from aligned sequences and explore its branching pattern.</div>',unsafe_allow_html=True)
+    try:
+        records=current_records()
+        if len({len(r.seq) for r in records})!=1: st.error('Sequences must have equal length and be aligned before tree construction.')
+        else:
+            x,y=st.columns([1,2.3])
+            with x:
+                st.markdown('<div class="pv-card"><div class="pv-section">Analysis settings</div><div class="pv-muted">Method: Neighbor Joining (NJ)<br>Distance: uncorrected p-distance (proportion of differing positions)</div></div>',unsafe_allow_html=True)
+                if st.button('Build phylogenetic tree',use_container_width=True):
+                    try:
+                        tree=build_tree(records,'identity'); st.session_state.tree=tree
+                        st.session_state.aligned_records=records; st.session_state.dist_df=make_distance_matrix(records)
+                        st.success('Tree built successfully.')
+                    except Exception as e: st.error(f'Could not build tree: {e}')
+                if st.session_state.tree is not None:
+                    newick_io=io.StringIO(); Phylo.write(st.session_state.tree,newick_io,'newick')
+                    st.download_button('Download tree (Newick)',newick_io.getvalue(),file_name='phylovision_tree.nwk',mime='text/plain',use_container_width=True)
+            with y:
+                if st.session_state.tree is not None:
+                    st.plotly_chart(rectangular_tree_figure(st.session_state.tree),use_container_width=True,config={'displaylogo':False,'scrollZoom':True})
+                    st.caption('Scroll to zoom • Drag to pan • Double-click to reset. Branch lengths represent estimated sequence change, not time.')
+                else:
+                    st.markdown('<div class="pv-card" style="min-height:310px;display:flex;flex-direction:column;justify-content:center;text-align:center"><div style="font-size:3rem">🌿</div><div class="pv-section">Your tree will appear here</div><div class="pv-muted">Review the input, then select “Build phylogenetic tree”.</div></div>',unsafe_allow_html=True)
+    except Exception as e: st.warning(str(e))
+
+elif page == 'Understand My Tree':
+    st.markdown('<div class="pv-title">Understand My Tree</div><div class="pv-muted">A plain-language guide to the tree you actually generated.</div>',unsafe_allow_html=True)
+    if st.session_state.tree is None:
+        st.info('Build a tree first in the Phylogenetic Tree tab. Then return here for interpretation.')
     else:
-        st.markdown("### About PhyloVision")
-        st.write("PhyloVision is an educational bioinformatics dashboard connecting sequence input, multiple sequence alignment and phylogenetic tree construction.")
-        st.write("It uses Biopython for sequence parsing, distance calculation and Neighbor Joining tree inference, with Plotly for interactive visualisation.")
-        st.warning("This prototype does not automatically calculate bootstrap confidence values. Install MAFFT or Clustal Omega for unequal-length sequences; otherwise, the fallback only accepts equal-length sequences and assumes they are already aligned.")
-st.markdown("---")
-st.markdown('<div class="small-muted">PhyloVision • Educational prototype • Verify sequence sources and methods before reporting scientific conclusions.</div>', unsafe_allow_html=True)
+        tree=st.session_state.tree; terms=tree.get_terminals(); names=[t.name for t in terms]
+        selected=st.selectbox('Choose a sequence to inspect',names)
+        chosen=next(t for t in terms if t.name==selected)
+        others=sorted([(tree.distance(chosen,t),t.name) for t in terms if t.name!=selected])
+        a,b=st.columns([1,1])
+        with a:
+            st.markdown('<div class="pv-card"><div class="pv-section">Selected sequence</div><div style="font-size:1.25rem;font-weight:700;color:#d8b0ff">'+selected+'</div><div class="pv-muted">Closest sequence by tree path</div><div style="font-size:1.1rem;margin-top:6px">'+others[0][1]+'</div><div class="pv-muted">Patristic distance: '+f'{others[0][0]:.4f}'+'</div></div>',unsafe_allow_html=True)
+        with b:
+            st.markdown('<div class="pv-card"><div class="pv-section">Interpretation guide</div><ul><li><b>Tips</b> are the sampled sequences.</li><li><b>Nodes</b> represent inferred branching points.</li><li><b>Branch lengths</b> represent estimated sequence change in this distance-based analysis.</li><li><b>Support values</b> are not calculated by this version.</li></ul></div>',unsafe_allow_html=True)
+        st.markdown('<div class="pv-card"><div class="pv-section">Key findings</div></div>',unsafe_allow_html=True)
+        for finding in explain_tree(tree,names): st.markdown(f'- {finding}')
+        st.warning('Interpretation is limited to the input sequences and the method. The tree does not prove direct ancestry, and this version does not calculate bootstrap confidence.')
+
+elif page == 'Sequence Similarity':
+    st.markdown('<div class="pv-title">Sequence Similarity</div><div class="pv-muted">Compare pairs of sequences and see how observed identity relates to their differences.</div>',unsafe_allow_html=True)
+    try:
+        records=current_records(); df=make_distance_matrix(records); sim=(1-df)*100; np.fill_diagonal(sim.values,100)
+        fig=go.Figure(data=go.Heatmap(z=sim.values,x=sim.columns,y=sim.index,colorscale=[[0,'#26294b'],[.5,'#8369be'],[1,'#75d4ba']],zmin=0,zmax=100,colorbar=dict(title='Identity %',tickfont=dict(color='#e8e5ff')),hovertemplate='%{y} vs %{x}<br>Identity: %{z:.2f}%<extra></extra>'))
+        fig.update_layout(height=max(400,len(records)*44),margin=dict(l=10,r=10,t=15,b=10),paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font=dict(color='#f2efff',size=11),xaxis=dict(tickangle=-35),yaxis=dict(autorange='reversed'))
+        st.plotly_chart(fig,use_container_width=True,config={'displaylogo':False})
+        st.markdown('<div class="pv-card"><div class="pv-section">What does this mean?</div><p>Pairwise identity is the percentage of compared, non-gap positions that match. Higher identity means fewer observed differences across those positions. This is a simple descriptive measure; it is not itself a complete evolutionary model.</p><p class="pv-muted">Gaps and ambiguous characters are excluded from each pairwise comparison. The displayed identity is not a bootstrap confidence score.</p></div>',unsafe_allow_html=True)
+        out=sim.round(2).to_csv(index=True)
+        st.download_button('Download similarity matrix (CSV)',out,file_name='phylovision_similarity.csv',mime='text/csv')
+        st.dataframe(sim.round(2).style.format('{:.2f}%'),use_container_width=True)
+    except Exception as e: st.warning(str(e))
+
+else: # Creators & About
+    st.markdown('<div class="pv-title">Creators & About</div><div class="pv-muted">The people and purpose behind PhyloVision.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="pv-card"><div class="pv-kicker">Project creator</div><div style="font-family:Manrope;font-size:1.5rem;font-weight:800;color:#e1b5ff;margin-top:4px">Anureet Dutta</div><div class="pv-muted">Creator & project lead</div><hr><div class="pv-kicker">Co-creators</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:12px">'+''.join(f'<div style="padding:14px 15px;border-radius:12px;background:#202747;border:1px solid #394369"><div style="font-weight:700;color:#f3edff">{name}</div><div class="pv-muted">Co-creator</div></div>' for name in CO_CREATORS)+'</div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="pv-card"><div class="pv-section">About the project</div><p>PhyloVision is an educational bioinformatics dashboard designed to connect multiple sequence alignment with phylogenetic tree construction and interpretation. It brings sequence input, an alignment view, a distance-based tree and pairwise identity summaries into one interface.</p><p><b>Learning outcomes:</b> FASTA handling, sequence validation, alignment inspection, pairwise similarity, distance-based tree construction and cautious biological interpretation.</p><p class="pv-muted">Current limitations: sequences must already be aligned and equal length; the tree uses Neighbor Joining with uncorrected p-distance; no bootstrap support is calculated; protein input is accepted for comparison, but this simple distance approach is not a substitute for a validated protein-specific evolutionary model. For research, use suitable validated tools and document sequence accessions and settings.</p></div>',unsafe_allow_html=True)
+    st.markdown('<div class="pv-card"><div class="pv-section">Credits & acknowledgement</div><p>Built as a student biotechnology software project, with a focus on making sequence-based evolutionary analysis easier to explore and explain.</p><div class="pv-muted">Better data. Clearer relationships. A deeper understanding of life.</div></div>',unsafe_allow_html=True)
+
+st.markdown('<hr><div style="text-align:center;color:#9ea8cc;font-size:.8rem;padding:8px 0">PhyloVision · From Sequences to Evolution · Educational use</div>',unsafe_allow_html=True)
