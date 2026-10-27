@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from Bio import SeqIO, AlignIO, Phylo
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from Bio.Align import MultipleSeqAlignment
 from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
 
 APP_DIR = Path(__file__).parent
@@ -58,7 +59,7 @@ st.markdown('')
 with st.sidebar:
     st.markdown('### 🧬 PhyloVision')
     st.caption('BIOINFORMATICS WORKSPACE')
-    page = st.radio('Navigate', ['Home','Sequence Input','Alignment Explorer','Phylogenetic Tree','Understand My Tree','Sequence Similarity','Creators & About'], label_visibility='collapsed')
+    page = st.radio('Navigate', ['Home','Sequence Input','Alignment Explorer','Phylogenetic Tree','Evolution Lens','Understand My Tree','Sequence Similarity','Creators & About'], label_visibility='collapsed')
     st.markdown('---')
     st.markdown('**Workflow**')
     st.markdown('1. Add sequences\n2. Review alignment\n3. Build a tree\n4. Interpret similarities')
@@ -71,6 +72,8 @@ if 'aligned_records' not in st.session_state: st.session_state.aligned_records =
 if 'dist_df' not in st.session_state: st.session_state.dist_df = None
 if 'tree_method' not in st.session_state: st.session_state.tree_method = 'Neighbor Joining'
 if 'sequence_type' not in st.session_state: st.session_state.sequence_type = 'DNA'
+if 'bootstrap_support' not in st.session_state: st.session_state.bootstrap_support = {}
+if 'tree_signature' not in st.session_state: st.session_state.tree_signature = None
 
 
 def parse_fasta(text):
@@ -117,15 +120,116 @@ def make_distance_matrix(records):
     return pd.DataFrame(mat,index=names,columns=names)
 
 
-def build_tree(records, model):
-    # DistanceCalculator's identity model is a transparent p-distance estimate (1 - identity).
-    calc_model = 'identity'
-    calculator=DistanceCalculator(calc_model, skip_letters='N?-')
-    dm=calculator.get_distance(records)
-    constructor=DistanceTreeConstructor()
-    tree=constructor.nj(dm)
-    tree.rooted=False
+def build_tree(records, model='Neighbor Joining'):
+    """Build a tree from an explicit Biopython MultipleSeqAlignment.
+
+    The original bug passed a plain list of SeqRecord objects to
+    DistanceCalculator.get_distance(); Biopython requires an Alignment object.
+    """
+    alignment = MultipleSeqAlignment([r[:] for r in records])
+    calculator = DistanceCalculator('identity', skip_letters='N?-X')
+    distance_matrix = calculator.get_distance(alignment)
+    constructor = DistanceTreeConstructor()
+    if model == 'UPGMA':
+        tree = constructor.upgma(distance_matrix)
+        tree.rooted = True
+    else:
+        tree = constructor.nj(distance_matrix)
+        tree.rooted = False
     return tree
+
+
+def _split_key(names):
+    """Canonical key for an unrooted bipartition."""
+    all_names = frozenset(names)
+    # A stable lexical representation makes equivalent splits comparable.
+    return tuple(sorted(all_names))
+
+
+def _tree_splits(tree):
+    """Return non-trivial unrooted splits for approximate bootstrap support."""
+    all_taxa = frozenset(t.name for t in tree.get_terminals())
+    splits = set()
+    for clade in tree.get_nonterminals():
+        side = frozenset(t.name for t in clade.get_terminals())
+        other = all_taxa - side
+        if len(side) < 2 or len(other) < 2:
+            continue
+        # For an unrooted split, the smaller side is canonical; ties are lexical.
+        a, b = tuple(sorted(side)), tuple(sorted(other))
+        splits.add(min(a, b) if len(a) == len(b) else (a if len(a) < len(b) else b))
+    return splits
+
+
+def bootstrap_tree(records, model='Neighbor Joining', replicates=100, seed=17):
+    """Column-resampling bootstrap; returns the original tree and split support %.
+
+    This is a standard non-parametric site bootstrap for an already-aligned
+    dataset. It is intentionally capped by the UI for a student-hosted app.
+    """
+    base_tree = build_tree(records, model)
+    n_sites = len(records[0].seq)
+    if n_sites < 2:
+        raise ValueError('At least two alignment positions are needed for bootstrap resampling.')
+    rng = np.random.default_rng(seed)
+    base_splits = _tree_splits(base_tree)
+    counts = {split: 0 for split in base_splits}
+    alignment_rows = [str(r.seq) for r in records]
+    for _ in range(int(replicates)):
+        cols = rng.integers(0, n_sites, size=n_sites)
+        sampled = [SeqRecord(Seq(''.join(row[i] for i in cols)), id=r.id, description='')
+                   for r, row in zip(records, alignment_rows)]
+        replicate_tree = build_tree(sampled, model)
+        rep_splits = _tree_splits(replicate_tree)
+        for split in base_splits:
+            if split in rep_splits:
+                counts[split] += 1
+    support = {split: 100.0 * count / int(replicates) for split, count in counts.items()}
+    return base_tree, support
+
+
+def pdf_report(records, tree, model, support, sequence_type):
+    """Create a compact, data-grounded PDF analysis report in memory."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.65*inch, leftMargin=0.65*inch,
+                            topMargin=0.6*inch, bottomMargin=0.6*inch)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='PVTitle', parent=styles['Title'], textColor=colors.HexColor('#55328a')))
+    story = [Paragraph('PhyloVision Analysis Report', styles['PVTitle']),
+             Paragraph('From Sequences to Evolution · Educational analysis', styles['Normal']), Spacer(1, 12),
+             Paragraph('Analysis summary', styles['Heading2']),
+             Paragraph(f'Sequence type: {sequence_type} · Sequences: {len(records)} · Alignment length: {len(records[0].seq)} positions · Method: {model} · Distance: uncorrected p-distance (identity)', styles['BodyText']), Spacer(1, 8),
+             Paragraph('Input sequences', styles['Heading2'])]
+    data = [['Sequence name', 'Length', 'Ambiguous/gap positions']]
+    for r in records:
+        seq = str(r.seq).upper()
+        data.append([r.id, str(len(seq)), str(sum(ch in '-N?X' for ch in seq))])
+    table = Table(data, repeatRows=1, colWidths=[3.2*inch, 1.1*inch, 2.0*inch])
+    table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#ded4f2')),('TEXTCOLOR',(0,0),(-1,0),colors.HexColor('#2b2142')),('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#c8c3d5')),('PADDING',(0,0),(-1,-1),6),('VALIGN',(0,0),(-1,-1),'TOP')]))
+    story += [table, Spacer(1, 12), Paragraph('Closest pair in inferred tree', styles['Heading2'])]
+    terms = tree.get_terminals()
+    pairs = sorted((tree.distance(a,b), a.name, b.name) for i,a in enumerate(terms) for b in terms[i+1:])
+    if pairs:
+        d, a, b = pairs[0]
+        story.append(Paragraph(f'{a} and {b} have the smallest tree-path distance ({d:.5f}). This does not imply direct ancestry.', styles['BodyText']))
+    story += [Spacer(1, 8), Paragraph('Bootstrap support', styles['Heading2'])]
+    if support:
+        rows = [['Split (taxa on smaller side)', 'Support']]
+        rows += [[', '.join(k), f'{v:.1f}%'] for k,v in sorted(support.items(), key=lambda item: item[1], reverse=True)]
+        stbl = Table(rows, repeatRows=1, colWidths=[5.5*inch, 1.0*inch])
+        stbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#ded4f2')),('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#c8c3d5')),('PADDING',(0,0),(-1,-1),5)]))
+        story.append(stbl)
+    else:
+        story.append(Paragraph('Bootstrap was not run for this analysis.', styles['BodyText']))
+    story += [Spacer(1, 12), Paragraph('Method and limitations', styles['Heading2']),
+              Paragraph('The input sequences were treated as an existing multiple sequence alignment. Neighbor Joining or UPGMA was applied to an identity-based distance matrix. Bootstrap percentages, when shown, come from resampling alignment columns with replacement and rebuilding trees; they measure split recovery under this procedure, not the probability that a clade is true. The app does not perform sequence alignment automatically. Confirm sequence homology, alignment quality, data source and model suitability before drawing biological conclusions.', styles['BodyText'])]
+    doc.build(story)
+    return buffer.getvalue()
 
 
 def rectangular_tree_figure(tree):
@@ -239,7 +343,7 @@ elif page == 'Sequence Input':
     with right:
         st.markdown('<div class="pv-card"><div class="pv-section">FASTA checklist</div><ul><li>Use a header starting with <code>&gt;</code>.</li><li>Use unique, readable sequence names.</li><li>Use homologous sequences from a documented source for real analysis.</li><li>Sequences must be aligned and equal in length for this version.</li></ul></div>',unsafe_allow_html=True)
         try:
-            recs=current_records(); st.metric('Sequences detected',len(recs)); st.metric('Sequence length',f'{len(recs[0].seq)} positions'); st.caption('Validation preview only; the full alignment should be biologically meaningful.')
+            recs=current_records(); st.metric('Sequences detected',len(recs)); st.metric('Sequence length',f'{len(recs[0].seq)} positions'); gaps=sum(str(r.seq).count('-') for r in recs); ambiguous=sum(sum(ch in 'N?X' for ch in str(r.seq).upper()) for r in recs); st.caption(f'Quality preview: {gaps} gap characters · {ambiguous} N/?/X ambiguous characters. Validation preview only; equal lengths do not prove a correct alignment.')
         except Exception as e: st.warning(str(e))
 
 elif page == 'Alignment Explorer':
@@ -262,35 +366,94 @@ elif page == 'Alignment Explorer':
     except Exception as e: st.warning(str(e))
 
 elif page == 'Phylogenetic Tree':
-    st.markdown('<div class="pv-title">Phylogenetic Tree</div><div class="pv-muted">Build a distance-based tree from aligned sequences and explore its branching pattern.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="pv-title">Phylogenetic Tree</div><div class="pv-muted">Build and explore a distance-based tree from an existing alignment.</div>',unsafe_allow_html=True)
     try:
         records=current_records()
-        if len({len(r.seq) for r in records})!=1: st.error('Sequences must have equal length and be aligned before tree construction.')
+        if len({len(r.seq) for r in records}) != 1:
+            st.error('Sequences must have equal length and be aligned before tree construction.')
         else:
             x,y=st.columns([1,2.3])
             with x:
-                st.markdown('<div class="pv-card"><div class="pv-section">Analysis settings</div><div class="pv-muted">Method: Neighbor Joining (NJ)<br>Distance: uncorrected p-distance (proportion of differing positions)</div></div>',unsafe_allow_html=True)
+                method = st.selectbox('Tree-building method', ['Neighbor Joining','UPGMA'], help='Neighbor Joining is unrooted; UPGMA assumes a constant rate of evolution.')
+                reps = st.slider('Bootstrap replicates', 0, 200, 0, step=25, help='0 disables bootstrap. Higher values take longer. Uses alignment-column resampling.')
+                st.markdown('<div class="pv-card"><div class="pv-section">Distance calculation</div><div class="pv-muted">Uncorrected p-distance based on observed identity. Gap/ambiguous handling is simplified for teaching use.</div></div>',unsafe_allow_html=True)
                 if st.button('Build phylogenetic tree',use_container_width=True):
                     try:
-                        tree=build_tree(records,'identity'); st.session_state.tree=tree
-                        st.session_state.aligned_records=records; st.session_state.dist_df=make_distance_matrix(records)
+                        with st.spinner('Building tree and evaluating resampled alignments…' if reps else 'Building tree…'):
+                            if reps:
+                                tree, support = bootstrap_tree(records, method, reps)
+                            else:
+                                tree, support = build_tree(records, method), {}
+                        st.session_state.tree=tree
+                        st.session_state.aligned_records=records
+                        st.session_state.dist_df=make_distance_matrix(records)
+                        st.session_state.bootstrap_support=support
+                        st.session_state.tree_method=method
+                        st.session_state.tree_signature=(st.session_state.fasta_text,st.session_state.sequence_type,method,reps)
                         st.success('Tree built successfully.')
-                    except Exception as e: st.error(f'Could not build tree: {e}')
-                if st.session_state.tree is not None:
+                    except Exception as e:
+                        st.error(f'Could not build tree: {e}')
+                if st.session_state.tree is not None and st.session_state.tree_signature and st.session_state.tree_signature[0] == st.session_state.fasta_text and st.session_state.tree_signature[1] == st.session_state.sequence_type:
                     newick_io=io.StringIO(); Phylo.write(st.session_state.tree,newick_io,'newick')
                     st.download_button('Download tree (Newick)',newick_io.getvalue(),file_name='phylovision_tree.nwk',mime='text/plain',use_container_width=True)
+                    try:
+                        report = pdf_report(records, st.session_state.tree, st.session_state.tree_method, st.session_state.bootstrap_support, st.session_state.sequence_type)
+                        st.download_button('Download analysis report (PDF)',report,file_name='phylovision_report.pdf',mime='application/pdf',use_container_width=True)
+                    except Exception as e:
+                        st.caption(f'PDF report unavailable: {e}')
             with y:
-                if st.session_state.tree is not None:
+                if st.session_state.tree is not None and st.session_state.tree_signature and st.session_state.tree_signature[0] == st.session_state.fasta_text and st.session_state.tree_signature[1] == st.session_state.sequence_type:
                     st.plotly_chart(rectangular_tree_figure(st.session_state.tree),use_container_width=True,config={'displaylogo':False,'scrollZoom':True})
                     st.caption('Scroll to zoom • Drag to pan • Double-click to reset. Branch lengths represent estimated sequence change, not time.')
+                    support = st.session_state.bootstrap_support
+                    if support:
+                        st.markdown('**Bootstrap split support**')
+                        support_df = pd.DataFrame([{'Taxa on smaller side of split': ', '.join(k), 'Support (%)': round(v,1)} for k,v in sorted(support.items(),key=lambda item:item[1],reverse=True)])
+                        st.dataframe(support_df,use_container_width=True,hide_index=True)
+                        st.caption('Support is the percentage of column-resampled trees recovering that split; it is not the probability that a clade is true.')
                 else:
-                    st.markdown('<div class="pv-card" style="min-height:310px;display:flex;flex-direction:column;justify-content:center;text-align:center"><div style="font-size:3rem">🌿</div><div class="pv-section">Your tree will appear here</div><div class="pv-muted">Review the input, then select “Build phylogenetic tree”.</div></div>',unsafe_allow_html=True)
+                    if st.session_state.tree is not None:
+                        st.info('Your input has changed since this tree was built. Build the tree again to refresh the result.')
+                    st.markdown('<div class="pv-card" style="min-height:310px;display:flex;flex-direction:column;justify-content:center;text-align:center"><div style="font-size:3rem">🌿</div><div class="pv-section">Your tree will appear here</div><div class="pv-muted">Review the input, choose a method, then build your tree.</div></div>',unsafe_allow_html=True)
     except Exception as e: st.warning(str(e))
+
+elif page == 'Evolution Lens':
+    st.markdown('<div class="pv-title">Evolution Lens</div><div class="pv-muted">Connect tree relationships to the sequence positions being compared.</div>',unsafe_allow_html=True)
+    try:
+        records=current_records()
+        if len({len(r.seq) for r in records}) != 1:
+            st.error('Provide equal-length aligned sequences to compare positions.')
+        else:
+            names=[r.id for r in records]
+            c1,c2=st.columns(2)
+            with c1: first=st.selectbox('First sequence',names,index=0,key='lens_first')
+            with c2: second=st.selectbox('Second sequence',names,index=1 if len(names)>1 else 0,key='lens_second')
+            if first == second:
+                st.info('Choose two different sequences to inspect their differences.')
+            else:
+                ra=next(r for r in records if r.id==first); rb=next(r for r in records if r.id==second)
+                diffs=[]; compared=0; matches=0
+                for pos,(a,b) in enumerate(zip(str(ra.seq).upper(),str(rb.seq).upper()),start=1):
+                    if a in '-N?X' or b in '-N?X': continue
+                    compared += 1
+                    if a == b: matches += 1
+                    else: diffs.append({'Alignment position':pos,first:a,second:b,'Change':f'{a} → {b}'})
+                identity=(matches/compared*100) if compared else float('nan')
+                a,b,c=st.columns(3); a.metric('Compared positions',compared); b.metric('Differences',len(diffs)); c.metric('Pairwise identity',f'{identity:.2f}%' if compared else 'N/A')
+                if diffs:
+                    st.markdown('**Observed differences**')
+                    st.dataframe(pd.DataFrame(diffs),use_container_width=True,hide_index=True)
+                    st.download_button('Export differences (CSV)',pd.DataFrame(diffs).to_csv(index=False),file_name='phylovision_sequence_differences.csv',mime='text/csv')
+                else:
+                    st.success('No differences were found among the comparable positions.')
+                st.caption('This view reports observed differences in your supplied alignment. It does not prove that any one mutation caused an evolutionary event.')
+    except Exception as e:
+        st.warning(str(e))
 
 elif page == 'Understand My Tree':
     st.markdown('<div class="pv-title">Understand My Tree</div><div class="pv-muted">A plain-language guide to the tree you actually generated.</div>',unsafe_allow_html=True)
-    if st.session_state.tree is None:
-        st.info('Build a tree first in the Phylogenetic Tree tab. Then return here for interpretation.')
+    if st.session_state.tree is None or not st.session_state.tree_signature or st.session_state.tree_signature[0] != st.session_state.fasta_text or st.session_state.tree_signature[1] != st.session_state.sequence_type:
+        st.info('Build or refresh the tree in the Phylogenetic Tree tab using your current input before interpreting it.')
     else:
         tree=st.session_state.tree; terms=tree.get_terminals(); names=[t.name for t in terms]
         selected=st.selectbox('Choose a sequence to inspect',names)
